@@ -11,6 +11,8 @@ from gpu_extras.batch import batch_for_shader
 
 _shader = None
 _fresnel_shader = None
+_mask_shader = None
+_mask_batches = {}  # {object_name: [(child_name, gpu_batch), ...]}
 
 # Current ghost frame batches — rebuilt on every frame change.
 # List of (object_name, frame, direction, t, dist, gpu_batch)
@@ -71,6 +73,43 @@ def get_shader():
             except ValueError:
                 _shader = gpu.shader.from_builtin('FLAT_COLOR')
     return _shader
+
+
+def get_mask_shader():
+    """Get or create the GPU shader for depth masking the current frame."""
+    global _mask_shader
+    if _mask_shader is None:
+        shader_info = gpu.types.GPUShaderCreateInfo()
+        shader_info.vertex_in(0, 'VEC3', 'pos')
+        shader_info.push_constant('MAT4', 'ModelViewProjectionMatrix')
+        shader_info.fragment_out(0, 'VEC4', 'fragColor')
+        shader_info.vertex_source("""
+            void main() {
+                vec4 clip = ModelViewProjectionMatrix * vec4(pos, 1.0);
+                gl_Position = vec4(clip.xy, -clip.w, clip.w);
+            }
+        """)
+        shader_info.fragment_source("""
+            void main() {
+                fragColor = vec4(0.0);
+            }
+        """)
+        _mask_shader = gpu.shader.create_from_info(shader_info)
+    return _mask_shader
+
+
+def set_mask_batches(batches):
+    global _mask_batches
+    _mask_batches = batches
+
+
+def get_mask_batches():
+    return _mask_batches
+
+
+def clear_mask_batches():
+    global _mask_batches
+    _mask_batches = {}
 
 
 def get_fresnel_shader():
@@ -222,10 +261,12 @@ def get_ghost_batch(index):
 # ---------------------------------------------------------------------------
 
 def cleanup():
-    global _shader, _fresnel_shader
+    global _shader, _fresnel_shader, _mask_shader
     _shader = None
     _fresnel_shader = None
+    _mask_shader = None
     clear_onion_batches()
+    clear_mask_batches()
     clear_ghost_markers()
     clear_frame_cache()
 

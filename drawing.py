@@ -351,6 +351,8 @@ def _build_onion_batches(context, current, depsgraph):
         for f, _, _, _ in needed:
             if not cache.has_frame(obj.name, f):
                 frames_to_eval.add(f)
+        if not cache.has_frame(obj.name, current):
+            frames_to_eval.add(current)
                 
     frames_to_eval = list(frames_to_eval)
     
@@ -417,6 +419,17 @@ def _build_onion_batches(context, current, depsgraph):
 
     cache.set_onion_batches(new_batches)
 
+    # Collect mask batches for current frame
+    mask_batches = {}
+    for item in scene.onion_skin_objects:
+        obj = item.object
+        if not obj or not item.visible:
+            continue
+        cur_batch = cache.get_frame(obj.name, current)
+        if cur_batch:
+            mask_batches[obj.name] = cur_batch
+    cache.set_mask_batches(mask_batches)
+
 
 # ---------------------------------------------------------------------------
 # Draw callbacks  (must be fast — no scene changes allowed here)
@@ -446,6 +459,39 @@ def draw_onion_skins():
     if not onion_batches and not ghost_markers:
         return
 
+    # Write near-plane depth for current frame objects to prevent ghost overlap
+    mask_batches = cache.get_mask_batches()
+    any_on_top = any(
+        (bpy.data.objects.get(name) and bpy.data.objects.get(name).onion_skin.keep_current_on_top)
+        for name in mask_batches
+    )
+    if any_on_top:
+        mask_shader = cache.get_mask_shader()
+        if mask_shader:
+            mv_matrix = gpu.matrix.get_model_view_matrix()
+            mvp_matrix = gpu.matrix.get_projection_matrix() @ mv_matrix
+            mask_shader.bind()
+            mask_shader.uniform_float("ModelViewProjectionMatrix", mvp_matrix)
+
+            gpu.state.color_mask_set(False, False, False, False)
+            gpu.state.depth_mask_set(True)
+            gpu.state.depth_test_set('ALWAYS')
+
+            for obj_name, cur_batch in mask_batches.items():
+                obj = bpy.data.objects.get(obj_name)
+                if not obj or not obj.visible_get() or not obj.onion_skin.keep_current_on_top:
+                    continue
+                if isinstance(cur_batch, list):
+                    for child_name, child_batch in cur_batch:
+                        child_obj = bpy.data.objects.get(child_name)
+                        if not child_obj or not child_obj.visible_get():
+                            continue
+                        child_batch.draw(mask_shader)
+                elif cur_batch:
+                    cur_batch.draw(mask_shader)
+
+            gpu.state.color_mask_set(True, True, True, True)
+
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_mask_set(False)
 
@@ -466,7 +512,33 @@ def draw_onion_skins():
             if not obj or not obj.visible_get(): continue
             settings = obj.onion_skin
             
-            gpu.state.depth_test_set('NONE' if settings.use_xray else 'LESS_EQUAL')
+            if settings.use_xray:
+                # Clear background depth if X-Ray is on, then re-apply current object depth mask if keep_current_on_top
+                if settings.keep_current_on_top:
+                    fb = gpu.state.active_framebuffer_get()
+                    fb.clear(depth=1.0)
+                    mask_shader = cache.get_mask_shader()
+                    if mask_shader:
+                        mask_shader.bind()
+                        mask_shader.uniform_float("ModelViewProjectionMatrix", mvp_matrix)
+                        gpu.state.color_mask_set(False, False, False, False)
+                        gpu.state.depth_mask_set(True)
+                        gpu.state.depth_test_set('ALWAYS')
+                        cur_batch = mask_batches.get(obj_name)
+                        if isinstance(cur_batch, list):
+                            for child_name, child_batch in cur_batch:
+                                child_obj = bpy.data.objects.get(child_name)
+                                if child_obj and child_obj.visible_get():
+                                    child_batch.draw(mask_shader)
+                        elif cur_batch:
+                            cur_batch.draw(mask_shader)
+                        gpu.state.color_mask_set(True, True, True, True)
+                        gpu.state.depth_mask_set(False)
+                    gpu.state.depth_test_set('LESS')
+                else:
+                    gpu.state.depth_test_set('NONE')
+            else:
+                gpu.state.depth_test_set('LESS' if settings.keep_current_on_top else 'LESS_EQUAL')
             if settings.use_wireframe:
                 gpu.state.line_width_set(1.5)
             else:

@@ -34,6 +34,7 @@ class ONION_OT_preset_add(AddPresetBase, bpy.types.Operator):
         "settings.opacity_falloff",
         "settings.falloff_curve",
         "settings.use_xray",
+        "settings.keep_current_on_top",
         "settings.use_wireframe",
         "settings.use_fresnel",
         "settings.fresnel_power",
@@ -225,6 +226,7 @@ class ONION_PT_appearance(Panel):
         row.prop(settings, "use_xray", toggle=True)
         row.prop(settings, "use_wireframe", toggle=True)
         row.prop(settings, "use_fresnel", toggle=True)
+        layout.prop(settings, "keep_current_on_top")
 
         if settings.use_fresnel and not settings.use_wireframe:
             layout.prop(settings, "fresnel_fade", text="Fresnel Fade")

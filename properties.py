@@ -214,6 +214,13 @@ class ONION_ObjectSettings(PropertyGroup):
         update=_just_redraw
     )
 
+    keep_current_on_top: BoolProperty(
+        name="Current On Top",
+        description="Always display the current frame object in front of onion skins",
+        default=True,
+        update=_just_redraw
+    )
+
     use_wireframe: BoolProperty(
         name="Wireframe",
         description="Draw ghosts as wireframe",
