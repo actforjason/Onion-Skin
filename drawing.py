@@ -497,14 +497,20 @@ def draw_onion_skins():
 
     # Onion skin frames (before/after)
     if onion_batches:
-        # Pre-compute view matrices once for Fresnel shader (no per-vertex cost)
+        # Pre-compute view matrices and camera vector once for Fresnel shader
         mv_matrix = gpu.matrix.get_model_view_matrix()
         mvp_matrix = gpu.matrix.get_projection_matrix() @ mv_matrix
-        normal_matrix = mv_matrix.to_3x3().inverted_safe().transposed()
 
-        # Detect orthographic vs perspective for Fresnel
         rv3d = context.space_data.region_3d
         is_ortho = 0.0 if rv3d.is_perspective else 1.0
+        vm = rv3d.view_matrix
+        if is_ortho > 0.5:
+            # Orthographic: view forward direction is row 2 of view_matrix
+            view_vec = (vm[2][0], vm[2][1], vm[2][2], 1.0)
+        else:
+            # Perspective: camera world position from inverted view_matrix translation column
+            inv = vm.inverted()
+            view_vec = (inv[0][3], inv[1][3], inv[2][3], 0.0)
 
         # Draw farthest frames first (painter's order)
         for obj_name, frame, direction, t, dist, batch in sorted(onion_batches, key=lambda x: -x[4]):
@@ -556,12 +562,9 @@ def draw_onion_skins():
                 current_shader = cache.get_fresnel_shader()
                 current_shader.bind()
                 current_shader.uniform_float("ModelViewProjectionMatrix", mvp_matrix)
-                current_shader.uniform_float("ModelViewMatrix", mv_matrix)
-                current_shader.uniform_float("NormalMatrix", normal_matrix)
+                current_shader.uniform_float("view_vector", view_vec)
                 current_shader.uniform_float("color", (base[0], base[1], base[2], alpha))
-                current_shader.uniform_float("fresnel_power", settings.fresnel_power)
-                current_shader.uniform_float("fresnel_fade", settings.fresnel_fade)
-                current_shader.uniform_float("is_ortho", is_ortho)
+                current_shader.uniform_float("fresnel_params", (settings.fresnel_power, settings.fresnel_fade, 0.0, 0.0))
             else:
                 current_shader = cache.get_shader()
                 current_shader.bind()

@@ -113,56 +113,49 @@ def clear_mask_batches():
 
 
 def get_fresnel_shader():
-    """Get or create the GPU shader for Fresnel effect."""
+    """Get or create the GPU shader for Fresnel effect.
+
+    Calculates Fresnel directly in world space using the camera origin / view direction,
+    requiring only ModelViewProjectionMatrix (64B) + view_vector (16B) + color (16B)
+    + fresnel_params (16B) = 112 bytes total. This strictly stays under the 128-byte
+    Vulkan Push Constant hardware minimum limit, completely eliminating driver warnings.
+    """
     global _fresnel_shader
     if _fresnel_shader is None:
-        # Define stage interface
         vert_out = gpu.types.GPUStageInterfaceInfo("fresnel_interface")
         vert_out.smooth('FLOAT', "v_fresnel")
 
-        # Create shader info
         shader_info = gpu.types.GPUShaderCreateInfo()
-        
-        # Vertex inputs
         shader_info.vertex_in(0, 'VEC3', "pos")
         shader_info.vertex_in(1, 'VEC3', "normal")
-        
-        # Interface outputs from vertex shader
         shader_info.vertex_out(vert_out)
-        
-        # Uniform push constants
+
+        # Uniform push constants: 64 + 16 + 16 + 16 = 112 bytes (<= 128 bytes limit)
         shader_info.push_constant('MAT4', "ModelViewProjectionMatrix")
-        shader_info.push_constant('MAT4', "ModelViewMatrix")
+        shader_info.push_constant('VEC4', "view_vector")   # xyz: camera world pos (persp) or forward dir (ortho), w: is_ortho
         shader_info.push_constant('VEC4', "color")
-        shader_info.push_constant('FLOAT', "fresnel_power")
-        shader_info.push_constant('FLOAT', "fresnel_fade")
-        shader_info.push_constant('MAT3', "NormalMatrix")
-        shader_info.push_constant('FLOAT', "is_ortho")
-        
-        # Fragment outputs
+        shader_info.push_constant('VEC4', "fresnel_params") # x: power, y: fade
+
         shader_info.fragment_out(0, 'VEC4', "fragColor")
 
-        # Shader source code
         shader_info.vertex_source('''
             void main() {
                 gl_Position = ModelViewProjectionMatrix * vec4(pos, 1.0);
                 vec3 view_dir;
-                if (is_ortho > 0.5) {
-                    view_dir = vec3(0.0, 0.0, 1.0);
+                if (view_vector.w > 0.5) {
+                    view_dir = normalize(view_vector.xyz);
                 } else {
-                    vec4 view_pos = ModelViewMatrix * vec4(pos, 1.0);
-                    view_dir = -normalize(view_pos.xyz);
+                    view_dir = normalize(view_vector.xyz - pos);
                 }
-                vec3 view_normal = normalize(NormalMatrix * normal);
-                
-                float f = 1.0 - abs(dot(view_normal, view_dir));
-                v_fresnel = pow(f, fresnel_power);
+                vec3 world_normal = normalize(normal);
+                float f = 1.0 - abs(dot(world_normal, view_dir));
+                v_fresnel = pow(f, fresnel_params.x);
             }
         ''')
-        
+
         shader_info.fragment_source('''
             void main() {
-                fragColor = vec4(color.rgb, color.a * mix(1.0, v_fresnel, fresnel_fade));
+                fragColor = vec4(color.rgb, color.a * mix(1.0, v_fresnel, fresnel_params.y));
             }
         ''')
 
