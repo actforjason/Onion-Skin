@@ -138,7 +138,7 @@ class ONION_ObjectSettings(PropertyGroup):
 
     frames_before: IntProperty(
         name="Frames Before",
-        description="Number of ghost frames before current",
+        description="Number of ghost frames or keyframes before current",
         default=3,
         min=1,
         soft_max=50,
@@ -147,7 +147,7 @@ class ONION_ObjectSettings(PropertyGroup):
 
     frames_after: IntProperty(
         name="Frames After",
-        description="Number of ghost frames after current",
+        description="Number of ghost frames or keyframes after current",
         default=3,
         min=1,
         soft_max=50,
@@ -160,6 +160,29 @@ class ONION_ObjectSettings(PropertyGroup):
         default=2,
         min=1,
         soft_max=10,
+        update=_update_redraw
+    )
+
+    keyframe_mode: EnumProperty(
+        name="Keyframe Filter",
+        description="How keyframes affect onion skin generation",
+        items=[
+            ('OFF', "Off", "Use regular frame step only", 'NONE', 0),
+            ('KEYFRAMES_ONLY', "Keyframes Only", "Only show onion skins on keyframe positions (overrides frame step)", 'KEYFRAME', 1),
+            ('KEYFRAMES_AND_STEP', "Keyframes + Step", "Show all keyframes, and fill gaps larger than frame step", 'KEYFRAME_HLT', 2),
+        ],
+        default='OFF',
+        update=_update_redraw
+    )
+
+    keyframe_range_mode: EnumProperty(
+        name="Range Mode",
+        description="Whether Before/After counts keyframe quantity or frame distance span",
+        items=[
+            ('COUNT', "Count", "Before/After represents number of keyframes", 'LINENUMBERS_ON', 0),
+            ('FRAMES', "Frames", "Before/After represents frame distance range", 'TIME', 1),
+        ],
+        default='COUNT',
         update=_update_redraw
     )
 

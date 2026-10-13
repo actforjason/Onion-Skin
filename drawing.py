@@ -232,11 +232,61 @@ def get_keyframe_range_for_object(obj):
     return min_frame, max_frame
 
 
+def get_keyframes_for_object(obj, include_children=True):
+    """Find all distinct keyframe frame numbers for an object and optional children."""
+    keyframes = set()
+
+    def _extract_from_anim_data(ad):
+        if not ad or not ad.action:
+            return
+        action = ad.action
+        # Blender < 4.4 legacy action
+        if hasattr(action, 'fcurves') and action.fcurves:
+            for fc in action.fcurves:
+                for kp in fc.keyframe_points:
+                    keyframes.add(int(round(kp.co[0])))
+        # Blender 4.4+ / 5.x layered action
+        if hasattr(action, 'layers'):
+            target_slot_handle = getattr(ad, 'action_slot_handle', None)
+            for layer in action.layers:
+                for strip in layer.strips:
+                    if hasattr(strip, 'channelbags'):
+                        for bag in strip.channelbags:
+                            if target_slot_handle is not None and hasattr(bag, 'slot_handle'):
+                                if bag.slot_handle != target_slot_handle:
+                                    continue
+                            if hasattr(bag, 'fcurves'):
+                                for fc in bag.fcurves:
+                                    for kp in fc.keyframe_points:
+                                        keyframes.add(int(round(kp.co[0])))
+
+    def _collect_from_id(id_data):
+        if not id_data:
+            return
+        if hasattr(id_data, 'animation_data'):
+            _extract_from_anim_data(id_data.animation_data)
+        if hasattr(id_data, 'shape_keys') and id_data.shape_keys:
+            if hasattr(id_data.shape_keys, 'animation_data'):
+                _extract_from_anim_data(id_data.shape_keys.animation_data)
+
+    _collect_from_id(obj)
+    if hasattr(obj, 'data'):
+        _collect_from_id(obj.data)
+
+    if include_children and obj.type == 'ARMATURE':
+        for child in obj.children_recursive:
+            _collect_from_id(child)
+            if hasattr(child, 'data'):
+                _collect_from_id(child.data)
+
+    return sorted(keyframes)
+
+
 def get_needed_frames(current, settings, scene, onion_skin_objects=None, obj=None):
     """Return list of (frame, direction, t, dist) for the current position.
 
-    When *obj* is provided the keyframe range is computed for that single
-    object so that "Limit to Keyframes" works independently per object.
+    When *obj* is provided the keyframe range and keyframes are computed for that
+    single object so that keyframe modes work independently per object.
     Falls back to the legacy all-objects behaviour when only
     *onion_skin_objects* is given.
     """
@@ -245,35 +295,150 @@ def get_needed_frames(current, settings, scene, onion_skin_objects=None, obj=Non
     if settings.use_frame_range and (current < range_start or current > range_end):
         return []
 
-    if settings.limit_to_keyframes:
+    # Retrieve all keyframes if keyframe filtering or limit_to_keyframes is needed
+    kf_mode = getattr(settings, 'keyframe_mode', 'OFF')
+    range_mode = getattr(settings, 'keyframe_range_mode', 'COUNT')
+    obj_keyframes = None
+
+    if kf_mode != 'OFF' or settings.limit_to_keyframes:
         if obj is not None:
-            kf_start, kf_end = get_keyframe_range_for_object(obj)
+            obj_keyframes = get_keyframes_for_object(obj, include_children=settings.include_children)
         elif onion_skin_objects:
-            kf_start, kf_end = get_keyframe_range(onion_skin_objects)
+            all_keys = set()
+            for item in onion_skin_objects:
+                if item.object and item.visible:
+                    all_keys.update(get_keyframes_for_object(item.object, include_children=item.object.onion_skin.include_children))
+            obj_keyframes = sorted(all_keys)
+
+    if settings.limit_to_keyframes:
+        if obj_keyframes:
+            range_start = max(range_start, obj_keyframes[0])
+            range_end = min(range_end, obj_keyframes[-1])
         else:
-            kf_start, kf_end = None, None
-        if kf_start is not None and kf_end is not None:
-            range_start = max(range_start, int(kf_start))
-            range_end = min(range_end, int(kf_end))
+            # Fallback to keyframe range search
+            if obj is not None:
+                kf_start, kf_end = get_keyframe_range_for_object(obj)
+            elif onion_skin_objects:
+                kf_start, kf_end = get_keyframe_range(onion_skin_objects)
+            else:
+                kf_start, kf_end = None, None
+            if kf_start is not None and kf_end is not None:
+                range_start = max(range_start, int(kf_start))
+                range_end = min(range_end, int(kf_end))
 
     frames = []
-    step = settings.frame_step
+    step = max(1, settings.frame_step)
 
-    if settings.show_before:
-        max_before = settings.frames_before
-        inv_max = 1.0 / max_before if max_before > 0 else 0
-        for i in range(step, max_before + 1, step):
-            f = current - i
-            if range_start <= f <= range_end:
-                frames.append((f, 'before', i * inv_max, i))
+    # -------------------------------------------------------------------------
+    # Mode: OFF (Regular Frame Step)
+    # -------------------------------------------------------------------------
+    if kf_mode == 'OFF':
+        if settings.show_before:
+            max_before = settings.frames_before
+            inv_max = 1.0 / max_before if max_before > 0 else 0
+            for i in range(step, max_before + 1, step):
+                f = current - i
+                if range_start <= f <= range_end:
+                    frames.append((f, 'before', i * inv_max, i))
 
-    if settings.show_after:
-        max_after = settings.frames_after
-        inv_max = 1.0 / max_after if max_after > 0 else 0
-        for i in range(step, max_after + 1, step):
-            f = current + i
-            if range_start <= f <= range_end:
-                frames.append((f, 'after', i * inv_max, i))
+        if settings.show_after:
+            max_after = settings.frames_after
+            inv_max = 1.0 / max_after if max_after > 0 else 0
+            for i in range(step, max_after + 1, step):
+                f = current + i
+                if range_start <= f <= range_end:
+                    frames.append((f, 'after', i * inv_max, i))
+
+        return frames
+
+    # -------------------------------------------------------------------------
+    # Modes: KEYFRAMES_ONLY and KEYFRAMES_AND_STEP
+    # -------------------------------------------------------------------------
+    keyframes_list = obj_keyframes if obj_keyframes is not None else []
+    before_keys = [k for k in keyframes_list if range_start <= k < current]
+    after_keys = [k for k in keyframes_list if current < k <= range_end]
+
+    # Process BEFORE
+    if settings.show_before and settings.frames_before > 0:
+        val_before = settings.frames_before
+        if kf_mode == 'KEYFRAMES_ONLY':
+            if range_mode == 'COUNT':
+                chosen = before_keys[-val_before:] if before_keys else []
+                total = len(chosen)
+                for rank, k in enumerate(reversed(chosen), 1):
+                    dist = current - k
+                    t = rank / total if total > 0 else 1.0
+                    frames.append((k, 'before', t, dist))
+            else:  # FRAMES span
+                chosen = [k for k in before_keys if current - k <= val_before]
+                for k in reversed(chosen):
+                    dist = current - k
+                    t = dist / val_before
+                    frames.append((k, 'before', t, dist))
+
+        elif kf_mode == 'KEYFRAMES_AND_STEP':
+            if range_mode == 'COUNT':
+                chosen_keys = before_keys[-val_before:] if before_keys else []
+                if chosen_keys:
+                    min_boundary = min(chosen_keys)
+                else:
+                    min_boundary = max(range_start, current - val_before * step)
+                max_span = max(current - min_boundary, 1)
+            else:  # FRAMES span
+                chosen_keys = [k for k in before_keys if current - k <= val_before]
+                min_boundary = max(range_start, current - val_before)
+                max_span = max(val_before, 1)
+
+            pts = set(chosen_keys)
+            for f in range(current - step, min_boundary - 1, -step):
+                if range_start <= f <= range_end:
+                    pts.add(f)
+
+            for f in sorted(pts, reverse=True):
+                dist = current - f
+                t = min(1.0, dist / max_span)
+                frames.append((f, 'before', t, dist))
+
+    # Process AFTER
+    if settings.show_after and settings.frames_after > 0:
+        val_after = settings.frames_after
+        if kf_mode == 'KEYFRAMES_ONLY':
+            if range_mode == 'COUNT':
+                chosen = after_keys[:val_after] if after_keys else []
+                total = len(chosen)
+                for rank, k in enumerate(chosen, 1):
+                    dist = k - current
+                    t = rank / total if total > 0 else 1.0
+                    frames.append((k, 'after', t, dist))
+            else:  # FRAMES span
+                chosen = [k for k in after_keys if k - current <= val_after]
+                for k in chosen:
+                    dist = k - current
+                    t = dist / val_after
+                    frames.append((k, 'after', t, dist))
+
+        elif kf_mode == 'KEYFRAMES_AND_STEP':
+            if range_mode == 'COUNT':
+                chosen_keys = after_keys[:val_after] if after_keys else []
+                if chosen_keys:
+                    max_boundary = max(chosen_keys)
+                else:
+                    max_boundary = min(range_end, current + val_after * step)
+                max_span = max(max_boundary - current, 1)
+            else:  # FRAMES span
+                chosen_keys = [k for k in after_keys if k - current <= val_after]
+                max_boundary = min(range_end, current + val_after)
+                max_span = max(val_after, 1)
+
+            pts = set(chosen_keys)
+            for f in range(current + step, max_boundary + 1, step):
+                if range_start <= f <= range_end:
+                    pts.add(f)
+
+            for f in sorted(pts):
+                dist = f - current
+                t = min(1.0, dist / max_span)
+                frames.append((f, 'after', t, dist))
 
     return frames
 

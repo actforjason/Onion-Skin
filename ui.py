@@ -29,6 +29,8 @@ class ONION_OT_preset_add(AddPresetBase, bpy.types.Operator):
         "settings.frames_before",
         "settings.frames_after",
         "settings.frame_step",
+        "settings.keyframe_mode",
+        "settings.keyframe_range_mode",
         "settings.color_before",
         "settings.color_after",
         "settings.opacity_falloff",
@@ -159,17 +161,29 @@ class ONION_PT_frames(Panel):
 
         settings = obj.onion_skin
 
+        # Keyframe filter mode
+        layout.prop(settings, "keyframe_mode", text="Keyframes")
+
+        if settings.keyframe_mode != 'OFF':
+            layout.prop(settings, "keyframe_range_mode", text="Mode")
+
         col = layout.column(align=True)
+
+        before_label = "Before (Keys)" if (settings.keyframe_mode != 'OFF' and settings.keyframe_range_mode == 'COUNT') else "Before"
+        after_label = "After (Keys)" if (settings.keyframe_mode != 'OFF' and settings.keyframe_range_mode == 'COUNT') else "After"
 
         row = col.row(align=True)
         row.prop(settings, "show_before", text="", icon='TRIA_LEFT')
-        row.prop(settings, "frames_before", text="Before")
+        row.prop(settings, "frames_before", text=before_label)
 
         row = col.row(align=True)
         row.prop(settings, "show_after", text="", icon='TRIA_RIGHT')
-        row.prop(settings, "frames_after", text="After")
+        row.prop(settings, "frames_after", text=after_label)
 
-        col.prop(settings, "frame_step")
+        step_row = col.row(align=True)
+        step_row.prop(settings, "frame_step")
+        if settings.keyframe_mode == 'KEYFRAMES_ONLY':
+            step_row.enabled = False
 
         layout.separator()
         layout.prop(settings, "limit_to_keyframes")
