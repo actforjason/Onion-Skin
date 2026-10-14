@@ -209,23 +209,31 @@ def get_keyframe_range_for_object(obj):
 
     For armatures this also checks the armature's own action so that
     pose-bone keyframes are respected.
+    For meshes this also checks parent/modifier armature actions.
     """
     min_frame = float('inf')
     max_frame = float('-inf')
 
+    def _check_action(id_data):
+        nonlocal min_frame, max_frame
+        if id_data and getattr(id_data, 'animation_data', None) and id_data.animation_data.action:
+            fr = id_data.animation_data.action.frame_range
+            min_frame = min(min_frame, fr[0])
+            max_frame = max(max_frame, fr[1])
+
     # Check the object's own action
-    if obj.animation_data and obj.animation_data.action:
-        fr = obj.animation_data.action.frame_range
-        min_frame = min(min_frame, fr[0])
-        max_frame = max(max_frame, fr[1])
+    _check_action(obj)
 
     # For armatures with mesh children, also consider child actions
     if obj.type == 'ARMATURE':
         for child in obj.children_recursive:
-            if child.animation_data and child.animation_data.action:
-                fr = child.animation_data.action.frame_range
-                min_frame = min(min_frame, fr[0])
-                max_frame = max(max_frame, fr[1])
+            _check_action(child)
+    elif obj.type == 'MESH':
+        if obj.parent and obj.parent.type == 'ARMATURE':
+            _check_action(obj.parent)
+        for mod in obj.modifiers:
+            if mod.type == 'ARMATURE' and mod.object:
+                _check_action(mod.object)
 
     if min_frame == float('inf'):
         return None, None
@@ -278,6 +286,12 @@ def get_keyframes_for_object(obj, include_children=True):
             _collect_from_id(child)
             if hasattr(child, 'data'):
                 _collect_from_id(child.data)
+    elif obj.type == 'MESH':
+        if obj.parent and obj.parent.type == 'ARMATURE':
+            _collect_from_id(obj.parent)
+        for mod in obj.modifiers:
+            if mod.type == 'ARMATURE' and mod.object:
+                _collect_from_id(mod.object)
 
     return sorted(keyframes)
 
@@ -461,18 +475,118 @@ def calculate_alpha(base_alpha, t, falloff, curve):
     return base_alpha * max(0.1, factor)
 
 
-def _safe_redraw(context):
+def _safe_redraw(context=None):
     """Safely trigger viewport redraw across all windows."""
     try:
-        if hasattr(context, "window_manager") and context.window_manager:
-            for window in context.window_manager.windows:
+        wm_list = []
+        if context and getattr(context, "window_manager", None):
+            wm_list.append(context.window_manager)
+        for wm in bpy.data.window_managers:
+            if wm not in wm_list:
+                wm_list.append(wm)
+        for wm in wm_list:
+            for window in wm.windows:
                 screen = window.screen
                 if screen:
                     for area in screen.areas:
                         if area.type == 'VIEW_3D':
                             area.tag_redraw()
-    except (AttributeError, ReferenceError):
+    except (AttributeError, ReferenceError, Exception):
         pass
+
+
+# ---------------------------------------------------------------------------
+# Animation State Tracking
+# ---------------------------------------------------------------------------
+
+_tracked_action_signatures = {}  # {object_name: signature}
+
+
+def _get_anim_data_signature(id_data):
+    """Extract a signature tuple for the animation data of a single ID block."""
+    if not id_data or not getattr(id_data, 'animation_data', None):
+        return None
+    ad = id_data.animation_data
+    act = ad.action
+    act_name = act.name if act else None
+
+    # In Blender 4.4+ / 5.x, handle Action Slots
+    slot_handle = getattr(ad, 'action_slot_handle', None)
+    slot_id = None
+    if hasattr(ad, 'action_slot') and ad.action_slot:
+        slot = ad.action_slot
+        slot_id = getattr(slot, 'identifier', None) or getattr(slot, 'name_display', None) or getattr(slot, 'handle', None)
+
+    tweak = getattr(ad, 'use_tweak_mode', False)
+    return (act_name, slot_handle, slot_id, tweak)
+
+
+def get_object_anim_signature(obj):
+    """Return a comprehensive hashable signature of all animation data driving an object."""
+    if not obj:
+        return None
+    sigs = []
+
+    # 1. Object's own animation_data
+    sigs.append(('self', _get_anim_data_signature(obj)))
+
+    # 2. Object's data animation_data (e.g. armature or mesh data)
+    if hasattr(obj, 'data') and obj.data:
+        sigs.append(('data', _get_anim_data_signature(obj.data)))
+        # Shape keys animation_data
+        if hasattr(obj.data, 'shape_keys') and obj.data.shape_keys:
+            sigs.append(('shape_keys', _get_anim_data_signature(obj.data.shape_keys)))
+
+    # 3. If Armature, include children animation data
+    if obj.type == 'ARMATURE':
+        for child in obj.children_recursive:
+            sigs.append(('child_' + child.name, _get_anim_data_signature(child)))
+            if hasattr(child, 'data') and hasattr(child.data, 'shape_keys') and child.data.shape_keys:
+                sigs.append(('child_sk_' + child.name, _get_anim_data_signature(child.data.shape_keys)))
+
+    # 4. If Mesh, include parent Armature or Armature Modifier's animation data
+    elif obj.type == 'MESH':
+        if obj.parent and obj.parent.type == 'ARMATURE':
+            sigs.append(('parent_arm', _get_anim_data_signature(obj.parent)))
+        for mod in obj.modifiers:
+            if mod.type == 'ARMATURE' and mod.object:
+                sigs.append(('mod_arm_' + mod.object.name, _get_anim_data_signature(mod.object)))
+
+    return tuple(sigs)
+
+
+def check_action_changes(scene):
+    """Check if any tracked object's animation signature has changed.
+
+    Returns True if any object's action/slot/animation state changed.
+    If changed, it invalidates the frame cache and onion batches.
+    """
+    global _tracked_action_signatures
+    any_changed = False
+    current_names = set()
+
+    for item in scene.onion_skin_objects:
+        obj = item.object
+        if not obj:
+            continue
+        current_names.add(obj.name)
+        new_sig = get_object_anim_signature(obj)
+        old_sig = _tracked_action_signatures.get(obj.name)
+
+        if old_sig is not None and old_sig != new_sig:
+            cache.clear_frame_cache(obj.name)
+            any_changed = True
+
+        _tracked_action_signatures[obj.name] = new_sig
+
+    removed = [k for k in _tracked_action_signatures if k not in current_names]
+    for k in removed:
+        del _tracked_action_signatures[k]
+
+    if any_changed:
+        cache.clear_onion_batches()
+
+    return any_changed
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +929,8 @@ def draw_ghost_labels():
 
 def _cleanup_handlers():
     """Remove all our handlers by name (prevents duplicates on reload)."""
+    global _tracked_action_signatures
+    _tracked_action_signatures.clear()
     our_names = {'_on_frame_change', '_on_depsgraph_update', '_on_undo_redo'}
     for handler_list in (bpy.app.handlers.frame_change_post,
                          bpy.app.handlers.depsgraph_update_post,
@@ -843,6 +959,9 @@ def _on_frame_change(scene, depsgraph):
     if any(item.object is None for item in scene.onion_skin_objects):
         return
 
+    # Invalidate stale frame cache if action changed (including when switching actions during playback)
+    check_action_changes(scene)
+
     context = bpy.context
     _build_onion_batches(context, scene.frame_current, depsgraph)
 
@@ -870,16 +989,19 @@ def _do_build():
     _safe_redraw(context)
     return None
 
-def _trigger_build():
+def _trigger_build(immediate=False):
     global _build_time
     _build_time = time.time()
+    if immediate:
+        _build_time = 0
     if not bpy.app.timers.is_registered(_do_build):
-        bpy.app.timers.register(_do_build, first_interval=0.02)
+        interval = 0.001 if immediate else 0.02
+        bpy.app.timers.register(_do_build, first_interval=interval)
 
 
 @persistent
 def _on_depsgraph_update(scene, depsgraph):
-    """Rebuild ghost batches when tracked objects are edited (e.g. pose change).
+    """Rebuild ghost batches when tracked objects are edited (e.g. pose change, action switch).
 
     Also handles stale (deleted) object cleanup.
     """
@@ -911,28 +1033,39 @@ def _on_depsgraph_update(scene, depsgraph):
     if getattr(bpy.context.screen, 'is_animation_playing', False):
         return
 
-    needs_update = False
-    for update in depsgraph.updates:
-        if isinstance(update.id, bpy.types.Action):
-            needs_update = True
-            break
-        elif isinstance(update.id, bpy.types.Object) and update.id.type in {'MESH', 'ARMATURE', 'CURVE', 'SURFACE', 'FONT'}:
-            # Geometry updates (modifiers, edits) are safe to rebuild when not actively deforming/posing (Object Mode)
-            if update.is_updated_geometry and bpy.context.mode == 'OBJECT':
+    # 1. Check if any tracked object's animation action or slot changed
+    action_changed = check_action_changes(scene)
+
+    needs_update = action_changed
+    if not needs_update:
+        for update in depsgraph.updates:
+            if isinstance(update.id, bpy.types.Action):
                 needs_update = True
+                cache.clear_frame_cache()
+                cache.clear_onion_batches()
                 break
+            elif isinstance(update.id, bpy.types.Object) and update.id.type in {'MESH', 'ARMATURE', 'CURVE', 'SURFACE', 'FONT'}:
+                # Geometry updates (modifiers, edits) are safe to rebuild when not actively deforming/posing (Object Mode)
+                if update.is_updated_geometry and bpy.context.mode == 'OBJECT':
+                    needs_update = True
+                    cache.clear_frame_cache()
+                    cache.clear_onion_batches()
+                    break
 
     if needs_update:
-        cache.clear_frame_cache()
-        _trigger_build()
+        _trigger_build(immediate=action_changed)
+        if action_changed:
+            _safe_redraw(bpy.context)
 
 
 @persistent
 def _on_undo_redo(scene):
     """Rebuild after undo/redo."""
+    _tracked_action_signatures.clear()
     cache.clear_frame_cache()
     cache.clear_onion_batches()
     cache.clear_ghost_markers()
+    _trigger_build(immediate=True)
 
 
 # ---------------------------------------------------------------------------

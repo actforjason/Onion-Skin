@@ -9,21 +9,23 @@ from bpy.props import (
 )
 
 
-def _safe_redraw(context):
+def _safe_redraw(context=None):
     """Safely trigger viewport redraw across all windows."""
     try:
-        if hasattr(context, "window_manager") and context.window_manager:
-            for window in context.window_manager.windows:
+        wm_list = []
+        if context and getattr(context, "window_manager", None):
+            wm_list.append(context.window_manager)
+        for wm in bpy.data.window_managers:
+            if wm not in wm_list:
+                wm_list.append(wm)
+        for wm in wm_list:
+            for window in wm.windows:
                 screen = window.screen
                 if screen:
                     for area in screen.areas:
                         if area.type == 'VIEW_3D':
                             area.tag_redraw()
-        elif hasattr(context, "screen") and context.screen:
-            for area in context.screen.areas:
-                if area.type == 'VIEW_3D':
-                    area.tag_redraw()
-    except (AttributeError, ReferenceError):
+    except (AttributeError, ReferenceError, Exception):
         pass
 
 
