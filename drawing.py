@@ -595,11 +595,46 @@ def check_action_changes(scene):
 
 _is_building = False
 
+def _extract_object_batches(obj, dg, settings):
+    """Extract GPU batches for a tracked object (and its children if armature) from depsgraph."""
+    objects_to_extract = []
+    _geo_types = {'MESH', 'CURVE', 'SURFACE', 'FONT'}
+    if obj.type in _geo_types:
+        objects_to_extract.append(obj)
+    elif obj.type == 'ARMATURE' and settings.include_children:
+        def add_children_recursive(parent):
+            for child in parent.children:
+                if child.type in _geo_types:
+                    objects_to_extract.append(child)
+                if child.children:
+                    add_children_recursive(child)
+        add_children_recursive(obj)
+
+    if not objects_to_extract:
+        return None
+
+    batches_list = []
+    for ext_obj in objects_to_extract:
+        verts, normals, indices, prim_type = extract_all_meshes_merged(
+            [ext_obj], dg, settings.use_wireframe
+        )
+        if verts is not None and indices is not None:
+            if settings.use_fresnel and not settings.use_wireframe and normals is not None:
+                current_shader = cache.get_fresnel_shader()
+                batch = batch_for_shader(current_shader, prim_type, {"pos": verts, "normal": normals}, indices=indices)
+            else:
+                current_shader = cache.get_shader()
+                batch = batch_for_shader(current_shader, prim_type, {"pos": verts}, indices=indices)
+            batches_list.append((ext_obj.name, batch))
+
+    return batches_list if batches_list else None
+
+
 def _build_onion_batches(context, current, depsgraph):
     """Evaluate all ghost frames and build GPU batches.
 
-    This is the ONLY place that calls scene.frame_set().  It runs in the
-    frame_change_post handler, never inside the draw callback.
+    Only ghost frames (frame != current) call scene.frame_set().
+    The current frame is extracted directly from the incoming depsgraph.
     """
     global _is_building
     if _is_building:
@@ -615,10 +650,10 @@ def _build_onion_batches(context, current, depsgraph):
     new_batches = []
     original_frame = scene.frame_current
     _is_building = True
-    
+
     obj_needed_frames = {}
     frames_to_eval = set()
-    
+
     for item in scene.onion_skin_objects:
         obj = item.object
         if not obj or not item.visible:
@@ -626,65 +661,39 @@ def _build_onion_batches(context, current, depsgraph):
         settings = obj.onion_skin
         needed = get_needed_frames(current, settings, scene, obj=obj)
         obj_needed_frames[obj.name] = needed
-        
+
         for f, _, _, _ in needed:
-            if not cache.has_frame(obj.name, f):
+            if f != current and not cache.has_frame(obj.name, f):
                 frames_to_eval.add(f)
-        if not cache.has_frame(obj.name, current):
-            frames_to_eval.add(current)
-                
+
     frames_to_eval = list(frames_to_eval)
-    
+
     try:
         for frame in frames_to_eval:
             scene.frame_set(frame)
             dg = context.evaluated_depsgraph_get()
-            
+
             for item in scene.onion_skin_objects:
                 obj = item.object
                 if not obj or not item.visible:
                     continue
-                
-                if not cache.has_frame(obj.name, frame):
-                    settings = obj.onion_skin
-                    objects_to_extract = []
-                    _geo_types = {'MESH', 'CURVE', 'SURFACE', 'FONT'}
-                    if obj.type in _geo_types:
-                        objects_to_extract.append(obj)
-                    elif obj.type == 'ARMATURE' and settings.include_children:
-                        def add_children_recursive(parent):
-                            for child in parent.children:
-                                if child.type in _geo_types:
-                                    objects_to_extract.append(child)
-                                if child.children:
-                                    add_children_recursive(child)
-                        add_children_recursive(obj)
 
-                    if objects_to_extract:
-                        batches_list = []
-                        for ext_obj in objects_to_extract:
-                            verts, normals, indices, prim_type = extract_all_meshes_merged(
-                                [ext_obj], dg, settings.use_wireframe
-                            )
-                            if verts is not None and indices is not None:
-                                if settings.use_fresnel and not settings.use_wireframe and normals is not None:
-                                    current_shader = cache.get_fresnel_shader()
-                                    batch = batch_for_shader(current_shader, prim_type, {"pos": verts, "normal": normals}, indices=indices)
-                                else:
-                                    current_shader = cache.get_shader()
-                                    batch = batch_for_shader(current_shader, prim_type, {"pos": verts}, indices=indices)
-                                batches_list.append((ext_obj.name, batch))
-                        
-                        if batches_list:
-                            cache.put_frame(obj.name, frame, batches_list)
-                        else:
-                            cache.put_frame(obj.name, frame, None)
-                    else:
-                        cache.put_frame(obj.name, frame, None)
+                if not cache.has_frame(obj.name, frame):
+                    batches = _extract_object_batches(obj, dg, obj.onion_skin)
+                    cache.put_frame(obj.name, frame, batches)
     finally:
         if frames_to_eval:
             scene.frame_set(original_frame)
         _is_building = False
+
+    # For current frame: extract directly from depsgraph without calling scene.frame_set()
+    for item in scene.onion_skin_objects:
+        obj = item.object
+        if not obj or not item.visible:
+            continue
+        if not cache.has_frame(obj.name, current):
+            batches = _extract_object_batches(obj, depsgraph, obj.onion_skin)
+            cache.put_frame(obj.name, current, batches)
 
     for item in scene.onion_skin_objects:
         obj = item.object
@@ -1038,15 +1047,24 @@ def _on_depsgraph_update(scene, depsgraph):
 
     needs_update = action_changed
     if not needs_update:
+        is_transforming = any(u.is_updated_transform for u in depsgraph.updates)
         for update in depsgraph.updates:
-            if isinstance(update.id, bpy.types.Action):
+            # Direct geometry data-block update (Edit mode mesh edits, curve changes, etc.)
+            if isinstance(update.id, (bpy.types.Mesh, bpy.types.Curve, bpy.types.SurfaceCurve, bpy.types.TextCurve)):
                 needs_update = True
                 cache.clear_frame_cache()
                 cache.clear_onion_batches()
                 break
+            # Object modifier or shape key updates in Object Mode (not active transforms)
             elif isinstance(update.id, bpy.types.Object) and update.id.type in {'MESH', 'ARMATURE', 'CURVE', 'SURFACE', 'FONT'}:
-                # Geometry updates (modifiers, edits) are safe to rebuild when not actively deforming/posing (Object Mode)
-                if update.is_updated_geometry and bpy.context.mode == 'OBJECT':
+                if update.is_updated_geometry and not update.is_updated_transform and bpy.context.mode == 'OBJECT':
+                    needs_update = True
+                    cache.clear_frame_cache()
+                    cache.clear_onion_batches()
+                    break
+            # Action update (e.g. keyframe edited in DopeSheet/GraphEditor when not actively transforming)
+            elif isinstance(update.id, bpy.types.Action):
+                if not is_transforming and bpy.context.mode not in {'POSE', 'PAINT_WEIGHT', 'SCULPT'}:
                     needs_update = True
                     cache.clear_frame_cache()
                     cache.clear_onion_batches()
