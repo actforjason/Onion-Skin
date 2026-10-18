@@ -583,9 +583,6 @@ def check_action_changes(scene):
     for k in removed:
         del _tracked_action_signatures[k]
 
-    if any_changed:
-        cache.clear_onion_batches()
-
     return any_changed
 
 
@@ -594,12 +591,42 @@ def check_action_changes(scene):
 # ---------------------------------------------------------------------------
 
 _is_building = False
+_GEO_OBJECT_TYPES = {'MESH', 'CURVE', 'SURFACE', 'FONT'}
+
+def _extract_object_batches(obj, dg, settings):
+    """Extract GPU batches for a tracked object (and its children if armature) from depsgraph."""
+    if obj.type in _GEO_OBJECT_TYPES:
+        objects_to_extract = [obj]
+    elif obj.type == 'ARMATURE' and settings.include_children:
+        objects_to_extract = [c for c in obj.children_recursive if c.type in _GEO_OBJECT_TYPES]
+    else:
+        objects_to_extract = []
+
+    if not objects_to_extract:
+        return None
+
+    batches_list = []
+    for ext_obj in objects_to_extract:
+        verts, normals, indices, prim_type = extract_all_meshes_merged(
+            [ext_obj], dg, settings.use_wireframe
+        )
+        if verts is not None and indices is not None:
+            if settings.use_fresnel and not settings.use_wireframe and normals is not None:
+                current_shader = cache.get_fresnel_shader()
+                batch = batch_for_shader(current_shader, prim_type, {"pos": verts, "normal": normals}, indices=indices)
+            else:
+                current_shader = cache.get_shader()
+                batch = batch_for_shader(current_shader, prim_type, {"pos": verts}, indices=indices)
+            batches_list.append((ext_obj.name, batch))
+
+    return batches_list if batches_list else None
+
 
 def _build_onion_batches(context, current, depsgraph):
     """Evaluate all ghost frames and build GPU batches.
 
-    This is the ONLY place that calls scene.frame_set().  It runs in the
-    frame_change_post handler, never inside the draw callback.
+    Only ghost frames (frame != current) call scene.frame_set().
+    The current frame is extracted directly from the incoming depsgraph.
     """
     global _is_building
     if _is_building:
@@ -612,84 +639,47 @@ def _build_onion_batches(context, current, depsgraph):
         cache.clear_onion_batches()
         return
 
+    active_items = [(it.object, it.object.onion_skin) for it in scene.onion_skin_objects if it.object and it.visible]
+    if not active_items:
+        cache.clear_onion_batches()
+        return
+
     new_batches = []
     original_frame = scene.frame_current
     _is_building = True
-    
+
     obj_needed_frames = {}
     frames_to_eval = set()
-    
-    for item in scene.onion_skin_objects:
-        obj = item.object
-        if not obj or not item.visible:
-            continue
-        settings = obj.onion_skin
+
+    for obj, settings in active_items:
         needed = get_needed_frames(current, settings, scene, obj=obj)
         obj_needed_frames[obj.name] = needed
-        
         for f, _, _, _ in needed:
-            if not cache.has_frame(obj.name, f):
+            if f != current and not cache.has_frame(obj.name, f):
                 frames_to_eval.add(f)
-        if not cache.has_frame(obj.name, current):
-            frames_to_eval.add(current)
-                
+
     frames_to_eval = list(frames_to_eval)
-    
+
     try:
         for frame in frames_to_eval:
             scene.frame_set(frame)
             dg = context.evaluated_depsgraph_get()
-            
-            for item in scene.onion_skin_objects:
-                obj = item.object
-                if not obj or not item.visible:
-                    continue
-                
+            for obj, settings in active_items:
                 if not cache.has_frame(obj.name, frame):
-                    settings = obj.onion_skin
-                    objects_to_extract = []
-                    _geo_types = {'MESH', 'CURVE', 'SURFACE', 'FONT'}
-                    if obj.type in _geo_types:
-                        objects_to_extract.append(obj)
-                    elif obj.type == 'ARMATURE' and settings.include_children:
-                        def add_children_recursive(parent):
-                            for child in parent.children:
-                                if child.type in _geo_types:
-                                    objects_to_extract.append(child)
-                                if child.children:
-                                    add_children_recursive(child)
-                        add_children_recursive(obj)
-
-                    if objects_to_extract:
-                        batches_list = []
-                        for ext_obj in objects_to_extract:
-                            verts, normals, indices, prim_type = extract_all_meshes_merged(
-                                [ext_obj], dg, settings.use_wireframe
-                            )
-                            if verts is not None and indices is not None:
-                                if settings.use_fresnel and not settings.use_wireframe and normals is not None:
-                                    current_shader = cache.get_fresnel_shader()
-                                    batch = batch_for_shader(current_shader, prim_type, {"pos": verts, "normal": normals}, indices=indices)
-                                else:
-                                    current_shader = cache.get_shader()
-                                    batch = batch_for_shader(current_shader, prim_type, {"pos": verts}, indices=indices)
-                                batches_list.append((ext_obj.name, batch))
-                        
-                        if batches_list:
-                            cache.put_frame(obj.name, frame, batches_list)
-                        else:
-                            cache.put_frame(obj.name, frame, None)
-                    else:
-                        cache.put_frame(obj.name, frame, None)
+                    batches = _extract_object_batches(obj, dg, settings)
+                    cache.put_frame(obj.name, frame, batches)
     finally:
         if frames_to_eval:
             scene.frame_set(original_frame)
         _is_building = False
 
-    for item in scene.onion_skin_objects:
-        obj = item.object
-        if not obj or not item.visible:
-            continue
+    # For current frame: extract directly from depsgraph without calling scene.frame_set()
+    for obj, settings in active_items:
+        if not cache.has_frame(obj.name, current):
+            batches = _extract_object_batches(obj, depsgraph, settings)
+            cache.put_frame(obj.name, current, batches)
+
+    for obj, _ in active_items:
         needed = obj_needed_frames.get(obj.name, [])
         for frame, direction, t, dist in needed:
             batch = cache.get_frame(obj.name, frame)
@@ -700,10 +690,7 @@ def _build_onion_batches(context, current, depsgraph):
 
     # Collect mask batches for current frame
     mask_batches = {}
-    for item in scene.onion_skin_objects:
-        obj = item.object
-        if not obj or not item.visible:
-            continue
+    for obj, _ in active_items:
         cur_batch = cache.get_frame(obj.name, current)
         if cur_batch:
             mask_batches[obj.name] = cur_batch
@@ -969,6 +956,45 @@ def _on_frame_change(scene, depsgraph):
 import time
 _build_time = 0
 
+_INTERACTIVE_PREFIXES = (
+    'TRANSFORM_OT_',
+    'POSE_OT_',
+    'ARMATURE_OT_',
+    'GRAPH_OT_',
+    'ACTION_OT_',
+)
+_INTERACTIVE_KEYWORDS = (
+    'transform',
+    'breakdown',
+    'blend',
+    'push',
+    'relax',
+    'slide',
+    'tween',
+    'ease',
+    'offset',
+    'smooth',
+    'shear',
+)
+
+def _is_user_interacting(context=None):
+    """Check if the user is currently performing an interactive modal operation.
+
+    Covers native transforms (G/R/S), pose breakdown/sliding/blending, and third-party
+    inbetween/slide tools (e.g. AnimAide, AnimBot, TweenMachine).
+    """
+    if context is None:
+        context = bpy.context
+    wm = getattr(context, 'window_manager', None)
+    if wm:
+        for win in wm.windows:
+            for op in getattr(win, 'modal_operators', ()):
+                idname = op.bl_idname
+                if idname.startswith(_INTERACTIVE_PREFIXES) or any(kw in idname.lower() for kw in _INTERACTIVE_KEYWORDS):
+                    return True
+    return False
+
+
 def _do_build():
     global _build_time
     # Debounce: Wait 0.02s after the last update before building
@@ -982,6 +1008,10 @@ def _do_build():
     # Do not interrupt playback
     if getattr(context.screen, 'is_animation_playing', False):
         return None
+
+    # Defer build if user is actively interacting (moving bones, breakdown, blend sliding)
+    if _is_user_interacting(context):
+        return 0.05
 
     scene = context.scene
     depsgraph = context.evaluated_depsgraph_get()
@@ -1033,29 +1063,39 @@ def _on_depsgraph_update(scene, depsgraph):
     if getattr(bpy.context.screen, 'is_animation_playing', False):
         return
 
-    # 1. Check if any tracked object's animation action or slot changed
-    action_changed = check_action_changes(scene)
+    # Do not clear cache or rebuild while user is interactively operating
+    if _is_user_interacting(bpy.context):
+        return
 
-    needs_update = action_changed
-    if not needs_update:
-        for update in depsgraph.updates:
-            if isinstance(update.id, bpy.types.Action):
+    # 1. Check if any tracked object's animation action or slot changed
+    if check_action_changes(scene):
+        _trigger_build(immediate=True)
+        _safe_redraw(bpy.context)
+        return
+
+    # 2. Check for keyframe edits or base geometry changes
+    needs_update = False
+    mode = bpy.context.mode
+    for update in depsgraph.updates:
+        uid = update.id
+        # Action update (e.g. keyframe edited or confirmed auto-keying in any mode)
+        if isinstance(uid, bpy.types.Action):
+            needs_update = True
+            break
+        # Direct geometry data-block update (Edit mode mesh edits, curve changes, etc.)
+        elif isinstance(uid, (bpy.types.Mesh, bpy.types.Curve, bpy.types.SurfaceCurve, bpy.types.TextCurve)):
+            if mode.startswith('EDIT') or mode == 'OBJECT':
                 needs_update = True
-                cache.clear_frame_cache()
-                cache.clear_onion_batches()
                 break
-            elif isinstance(update.id, bpy.types.Object) and update.id.type in {'MESH', 'ARMATURE', 'CURVE', 'SURFACE', 'FONT'}:
-                # Geometry updates (modifiers, edits) are safe to rebuild when not actively deforming/posing (Object Mode)
-                if update.is_updated_geometry and bpy.context.mode == 'OBJECT':
-                    needs_update = True
-                    cache.clear_frame_cache()
-                    cache.clear_onion_batches()
-                    break
+        # Object modifier or shape key updates in Object Mode
+        elif isinstance(uid, bpy.types.Object) and uid.type in _GEO_OBJECT_TYPES:
+            if update.is_updated_geometry and not update.is_updated_transform and mode == 'OBJECT':
+                needs_update = True
+                break
 
     if needs_update:
-        _trigger_build(immediate=action_changed)
-        if action_changed:
-            _safe_redraw(bpy.context)
+        cache.clear_frame_cache()
+        _trigger_build(immediate=False)
 
 
 @persistent
